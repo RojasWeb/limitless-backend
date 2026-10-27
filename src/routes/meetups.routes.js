@@ -50,29 +50,39 @@ router.get('/', optionalAuth, async (req, res) => {
     const { rows } = await db.query(queryStr, params);
 
     // Mapeo amigable para el frontend de LIMITLESS
-    const mapped = rows.map(r => ({
-      id: String(r.meetup_id),
-      titulo: r.titulo,
-      deporte: r.deporte_slug,
-      deporteNombre: r.deporte_nombre,
-      icono: r.deporte_icono,
-      fecha: r.fecha instanceof Date ? r.fecha.toISOString().split('T')[0] : String(r.fecha),
-      hora: String(r.hora_inicio).slice(0, 5),
-      lugar: r.ubicacion,
-      ciudad: r.ciudad,
-      nivel: r.nivel,
-      cupoMax: r.maximo_participantes,
-      cupoActual: parseInt(r.participantes_actuales, 10),
-      cuposDisponibles: parseInt(r.cupos_disponibles, 10),
-      estado: r.estado_calculado,
-      unido: Boolean(r.unido),
-      creador: {
-        id: r.creador_id,
-        nombre: `${r.creador_nombre} ${r.creador_apellido}`.trim(),
-        avatar: r.creador_foto
-      },
-      descripcion: r.descripcion
-    }));
+    const mapped = rows.map(r => {
+      const creatorName = `${r.creador_nombre || ''} ${r.creador_apellido || ''}`.trim() || 'Organizador';
+      const creatorAvatar = r.creador_foto || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=200&q=80';
+      const meetupImg = r.imagen || r.deporte_imagen || r.imagen_url || 'https://images.unsplash.com/photo-1546519638-68e109498ffc?auto=format&fit=crop&w=800&q=80';
+
+      return {
+        id: String(r.meetup_id),
+        titulo: r.titulo,
+        deporte: r.deporte_slug,
+        deporteNombre: r.deporte_nombre,
+        icono: r.deporte_icono,
+        imagen: meetupImg,
+        imagen_url: meetupImg,
+        fecha: r.fecha instanceof Date ? r.fecha.toISOString().split('T')[0] : String(r.fecha),
+        hora: String(r.hora_inicio).slice(0, 5),
+        lugar: r.ubicacion,
+        ciudad: r.ciudad,
+        nivel: r.nivel,
+        cupoMax: r.maximo_participantes,
+        cupoActual: parseInt(r.participantes_actuales, 10),
+        cuposDisponibles: parseInt(r.cupos_disponibles, 10),
+        estado: r.estado_calculado,
+        unido: Boolean(r.unido),
+        organizador: creatorName,
+        organizadorAvatar: creatorAvatar,
+        creador: {
+          id: r.creador_id,
+          nombre: creatorName,
+          avatar: creatorAvatar
+        },
+        descripcion: r.descripcion
+      };
+    });
 
     return res.json({ success: true, count: mapped.length, data: mapped });
   } catch (err) {
@@ -134,7 +144,7 @@ router.get('/:id', optionalAuth, async (req, res) => {
 router.post('/', requireAuth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const { deporte, deporte_id, titulo, descripcion, fecha, hora, lugar, ciudad, nivel, cupoMax } = req.body;
+    const { deporte, deporte_id, titulo, descripcion, fecha, hora, lugar, ciudad, nivel, cupoMax, imagen_url, imagen } = req.body;
 
     if (!titulo || !fecha || !hora || !lugar) {
       return res.status(400).json({
@@ -145,23 +155,23 @@ router.post('/', requireAuth, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Resolver ID de deporte si viene en slug
     let resolvedSportId = deporte_id;
     if (!resolvedSportId && deporte) {
       const sRes = await client.query('SELECT id FROM sports WHERE slug = $1', [deporte.toLowerCase()]);
       if (sRes.rows.length > 0) resolvedSportId = sRes.rows[0].id;
     }
-    if (!resolvedSportId) resolvedSportId = 1; // Default basketball
+    if (!resolvedSportId) resolvedSportId = 1;
 
     const insertMeetup = `
       INSERT INTO meetups (
-        creador_id, deporte_id, titulo, descripcion, fecha, hora_inicio, ubicacion, ciudad, nivel, maximo_participantes, estado
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'abierto')
+        creador_id, deporte_id, titulo, descripcion, fecha, hora_inicio, ubicacion, ciudad, nivel, maximo_participantes, imagen_url, estado
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'abierto')
       RETURNING *
     `;
 
     const formattedHora = hora.length === 5 ? `${hora}:00` : hora;
     const maxPart = parseInt(cupoMax, 10) || 10;
+    const resolvedImgUrl = (imagen_url || imagen || '').trim() || null;
 
     const mRes = await client.query(insertMeetup, [
       req.user.id,
@@ -173,12 +183,12 @@ router.post('/', requireAuth, async (req, res) => {
       lugar.trim(),
       ciudad ? ciudad.trim() : (req.user.ciudad || 'Cartago'),
       nivel || 'Todos los niveles',
-      maxPart
+      maxPart,
+      resolvedImgUrl
     ]);
 
     const newMeetup = mRes.rows[0];
 
-    // Auto-unir al creador
     await client.query(
       `INSERT INTO meetup_participants (meetup_id, user_id, estado)
        VALUES ($1, $2, 'aceptado')
@@ -210,17 +220,13 @@ router.post('/:id/join', requireAuth, async (req, res) => {
   try {
     const meetupId = parseInt(req.params.id, 10);
 
-    // Verificar si ya está unido
     const existing = await db.query(
       'SELECT id, estado FROM meetup_participants WHERE meetup_id = $1 AND user_id = $2',
       [meetupId, req.user.id]
     );
 
     if (existing.rows.length > 0) {
-      // Si ya estaba unido, lo retiramos
       await db.query('DELETE FROM meetup_participants WHERE id = $1', [existing.rows[0].id]);
-      
-      // Actualizar estado del meetup si estaba lleno y ahora tiene cupo
       await db.query(
         `UPDATE meetups SET estado = 'abierto' WHERE id = $1 AND estado = 'lleno'`,
         [meetupId]
@@ -232,7 +238,6 @@ router.post('/:id/join', requireAuth, async (req, res) => {
         message: 'Has liberado tu cupo en este junte deportivo.'
       });
     } else {
-      // Inserción: el trigger trg_check_meetup_capacity valida automáticamente que no haya sobrecupo
       await db.query(
         `INSERT INTO meetup_participants (meetup_id, user_id, estado)
          VALUES ($1, $2, 'aceptado')`,
@@ -247,7 +252,6 @@ router.post('/:id/join', requireAuth, async (req, res) => {
     }
   } catch (err) {
     console.error('Error en POST /meetups/:id/join:', err);
-    // Si saltó la excepción del trigger de sobrecupo:
     if (err.message && err.message.includes('capacidad máxima')) {
       return res.status(409).json({ success: false, error: err.message });
     }
